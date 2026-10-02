@@ -1,0 +1,228 @@
+# Cluster Setup
+
+This document describes how the two-node Kubernetes cluster was prepared and initialized using `kubeadm`.
+
+## 1. Lab Topology
+
+| Node | Role | IP |
+|---|---|---|
+| `k8s-control` | Control Plane | `192.168.178.110` |
+| `k8s-worker01` | Worker | `192.168.178.111` |
+
+Both nodes run Ubuntu 26.04 LTS inside VMware Workstation on VMnet8 NAT.
+
+## 2. Configure Stable Node IPs
+
+The VMware DHCP pool was:
+
+```text
+192.168.178.128 - 192.168.178.254
+Static addresses outside this range were selected:
+k8s-control   -> 192.168.178.110/24
+k8s-worker01  -> 192.168.178.111/24
+Gateway       -> 192.168.178.2
+DNS           -> 192.168.178.2
+Example Netplan configuration:
+network:
+  ethernets:
+    ens33:
+      dhcp4: false
+      dhcp6: true
+      addresses:
+        - 192.168.178.110/24
+      routes:
+        - to: default
+          via: 192.168.178.2
+      nameservers:
+        addresses:
+          - 192.168.178.2
+      match:
+        macaddress: 00:0c:29:ca:a7:1a
+      set-name: ens33
+  version: 2
+Validate and apply:
+sudo netplan generate
+sudo netplan try
+Verify:
+ip addr show ens33
+ip route
+resolvectl status ens33
+3. Hostname Resolution
+Local host entries were added so the nodes could resolve each other.
+Example:
+192.168.178.110 control
+192.168.178.111 worker01
+Connectivity was verified with:
+ping control
+ping worker01
+4. Disable Swap
+Kubernetes nodes were configured with swap disabled.
+Check active swap:
+swapon --show
+Disable it:
+sudo swapoff -a
+The persistent swap entry in /etc/fstab was commented out:
+#/swap.img none swap sw 0 0
+Verify:
+swapon --show
+free -h
+Expected:
+Swap: 0B
+5. Kernel Modules
+Required kernel modules were loaded:
+sudo modprobe overlay
+sudo modprobe br_netfilter
+To load them automatically after reboot:
+/etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+Verify:
+lsmod | grep overlay
+lsmod | grep br_netfilter
+6. Kernel Networking Settings
+The following settings were configured in:
+/etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+Apply:
+sudo sysctl --system
+Verify:
+sysctl net.bridge.bridge-nf-call-iptables
+sysctl net.bridge.bridge-nf-call-ip6tables
+sysctl net.ipv4.ip_forward
+Expected:
+= 1
+= 1
+= 1
+7. Configure containerd
+Install containerd:
+sudo apt update
+sudo apt install -y containerd
+Generate the default configuration if required:
+sudo mkdir -p /etc/containerd
+
+containerd config default \
+  | sudo tee /etc/containerd/config.toml > /dev/null
+Configure the systemd cgroup driver:
+SystemdCgroup = true
+Restart containerd:
+sudo systemctl restart containerd
+Verify:
+containerd --version
+systemctl status containerd --no-pager
+sudo ctr plugins ls | grep cri
+The CRI plugins should report:
+ok
+8. Install Kubernetes Packages
+Install repository prerequisites:
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gpg
+Create the keyring directory:
+sudo mkdir -p -m 755 /etc/apt/keyrings
+Add the Kubernetes repository key:
+curl -fsSL \
+  https://pkgs.k8s.io/core:/stable:/v1.37/deb/Release.key \
+  | sudo gpg --dearmor \
+  -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+Add the Kubernetes repository:
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.37/deb/ /' \
+  | sudo tee /etc/apt/sources.list.d/kubernetes.list
+Install:
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+Prevent automatic upgrades:
+sudo apt-mark hold kubelet kubeadm kubectl
+Verify:
+kubelet --version
+kubeadm version
+kubectl version --client
+Cluster version used:
+v1.37.1
+9. Initialize the Control Plane
+On k8s-control:
+sudo kubeadm init \
+  --apiserver-cert-extra-sans=controlplane \
+  --apiserver-advertise-address=192.168.178.110 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --service-cidr=10.96.0.0/12
+This created:
+- Kubernetes PKI certificates
+- kubeconfig files
+- etcd static Pod
+- kube-apiserver static Pod
+- kube-controller-manager static Pod
+- kube-scheduler static Pod
+- kubelet configuration
+- bootstrap token
+- CoreDNS
+- kube-proxy
+10. Configure kubectl
+For the regular control-plane user:
+mkdir -p $HOME/.kube
+
+sudo cp -i \
+  /etc/kubernetes/admin.conf \
+  $HOME/.kube/config
+
+sudo chown \
+  $(id -u):$(id -g) \
+  $HOME/.kube/config
+Verify:
+kubectl get nodes
+Before installing a CNI, the control-plane node initially appeared as:
+NotReady
+This was expected because Pod networking had not yet been configured.
+11. Install Flannel CNI
+Install Flannel:
+kubectl apply -f \
+  https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+Verify:
+kubectl get pods -n kube-flannel -o wide
+kubectl get nodes
+Once Flannel initialized successfully, the control-plane node changed from:
+NotReady
+to:
+Ready
+CoreDNS Pods also became Running.
+12. Join the Worker
+The worker was joined using the command generated by kubeadm init.
+Example structure:
+sudo kubeadm join 192.168.178.110:6443 \
+  --token <bootstrap-token> \
+  --discovery-token-ca-cert-hash sha256:<ca-hash>
+The actual token and CA hash are not stored in this repository.
+Verify from the control plane:
+kubectl get nodes -o wide
+Expected:
+k8s-control    Ready   control-plane
+k8s-worker01   Ready
+13. Verify Cluster Networking
+Check allocated Pod CIDRs:
+kubectl get nodes \
+  -o custom-columns=NAME:.metadata.name,PODCIDR:.spec.podCIDR
+Example:
+k8s-control    10.244.0.0/24
+k8s-worker01   10.244.1.0/24
+Cross-node Pod connectivity was validated using temporary BusyBox Pods.
+The Pods were kept running using:
+sleep 3600
+Connectivity was tested using:
+ping
+traceroute
+between Pod IPs on both nodes.
+14. Final Validation
+Check node status:
+kubectl get nodes -o wide
+Check all Pods:
+kubectl get pods -A -o wide
+Check Flannel:
+kubectl get daemonset -n kube-flannel
+Check kube-proxy:
+kubectl get daemonset -n kube-system kube-proxy
+The final cluster consists of:
+1 Control Plane
+1 Worker Node
+Flannel CNI
+containerd runtime
+Kubernetes v1.37.1
